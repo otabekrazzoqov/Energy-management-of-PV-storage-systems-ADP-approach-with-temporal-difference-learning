@@ -1,0 +1,114 @@
+from pulp import *
+import numpy as np
+import pandas as pd
+from matplotlib import pyplot as plt
+
+load = np.array([0.580416667,0.539066667,0.390116667,0.232033333,
+0.204533333,0.194716667,0.194633333,0.209233333,
+0.247266668,0.407916668,0.537349998,0.576983332,
+0.580216667,0.520566667,0.485200003,0.4197,
+0.424300002,0.448333332,0.546983333,0.840733333,
+1.320233332,0.856422014,0.921716667,0.720283335]*5)
+
+solar_rad = np.array([0,0,0,0,
+0.846573268,6.670823882,22.34096457,48.40323145,
+95.10129002,161.7686087,236.9894473,293.9150696,
+305.3854497,294.6843366,251.7269744,182.2991627,
+123.210826,73.11869927,33.55642336,9.910144956,
+1.621109317,0.008980831,0,0]*5)
+
+T = len(load)
+
+# Decision variables
+Bmax = LpVariable('Bmax', 0, None) # battery max energy (kWh)
+PV_size = LpVariable('PV_size', 0, None) # PV size
+
+# Optimisation problem
+prb = LpProblem('Battery_Operation', LpMinimize)
+
+# Auxilliary variables
+PV_gen = [LpVariable('PV_gen_{}'.format(i), 0, None) for i in range(T)]
+
+# Load difference
+Pflow = [LpVariable('Pflow_{}'.format(i), None, None) for i in range(T)]
+# Excess PV
+Pcharge = [LpVariable('Pcharge_{}'.format(i), lowBound=0, upBound=None) for i in range(T)]
+# Discharge required
+Pdischarge = [LpVariable('Pdischarge_{}'.format(i), lowBound=None, upBound=0) for i in range(T)]
+# Charge delivered
+Pcharge_a = [LpVariable('Pcharge_a{}'.format(i), 0, None) for i in range(T)]
+
+###  Moved this down as it needs to include Pdischarge
+# Objective function
+# cost + some small penalty for cumulative discharge, just to shape behavior
+prb += (PV_size*500) + (Bmax*1500)  - 0.01 * lpSum(Pdischarge[t] for t in range(T)) 
+
+# Battery
+Bstate = [LpVariable('E_{}'.format(i), 0, None) for i in range(T)]
+
+# Battery Constraints
+### NOTE this is killed to allow initial state to "float"
+#prb += Bstate[0] == Bmax + Pdischarge[0] + Pcharge_a[0]
+for t in range(1, T):
+    prb += Bstate[t] == Bstate[t-1] + Pdischarge[t] + Pcharge_a[t] 
+
+# Power flow Constraints
+for t in range(0, T):
+    
+    # PV generation
+    prb += PV_gen[t] == PV_size*0.2*solar_rad[t]/1000
+    
+    # Pflow is the energy flow reuired *from the battery* to meet the load
+    # Negative if load greater than PV, positive if PV greater than load
+    prb += Pflow[t] == PV_gen[t] - load[t]
+    
+    # Given the below, it will push Pflow available for charge to zero or to to or greater than excess PV
+    prb += Pcharge[t] >= 0
+    prb += Pcharge[t] >= Pflow[t]
+
+    # If Pflow is negative (discharge), then it will at least ePflowual discharge rePflowuired
+    # If Pflow is positive (charge), then Pdischarge (discharge rePflowuired will ePflowual 0)
+    prb += Pdischarge[t] <= 0
+    prb += Pdischarge[t] <= Pflow[t]
+    # Discharge cannot exceed available charge in battery
+    # Discharge is negative
+    prb += Pdischarge[t] >= (-1)*Bstate[t-1]
+    
+    # Ensures that energy flow rePflowuired is satisifed by charge and discharge flows
+    prb += Pflow[t] == Pcharge[t] + Pdischarge[t] 
+    
+    # Limit amount charge delivered by the available space in the battery
+    prb += Pcharge_a[t] >= 0
+    prb += Pcharge_a[t] <= Pcharge[t]
+    prb += Pcharge_a[t] <= Bmax - Bstate[t-1]
+    
+    prb += Bstate[t] >= 0
+    prb += Bstate[t] <= Bmax
+    
+# Solve problem
+prb.solve()
+
+# make some records to prep for dataframe (what a pain in pulp!!)
+res = []
+for t in range(T):
+    record = {  'period': t,
+                'Load': load[t],
+                'PV_gen': PV_gen[t].varValue,
+                'Pflow' : Pflow[t].varValue,
+                'Pcharge': Pcharge[t].varValue,
+                'Pcharge_a': Pcharge_a[t].varValue,
+                'Pdischarge': Pdischarge[t].varValue,
+                'Bstate': Bstate[t].varValue}
+    res.append(record)
+
+df = pd.DataFrame.from_records(res)
+df.set_index('period', inplace=True)
+df = df.round(2)
+print(df.to_string())
+
+print(f'PV size: {PV_size.varValue : 0.1f}, Batt size: {Bmax.varValue : 0.1f}')
+
+df.plot()
+plt.show()
+
+
